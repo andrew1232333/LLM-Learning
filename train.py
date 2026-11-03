@@ -33,6 +33,8 @@ def get_args():
     p.add_argument("--config", type=Path, help="TOML file of settings; flags on the command line override it")
     p.add_argument("--out_dir", type=Path, default=OUT_DIR, help="where the checkpoint and settings are saved")
     p.add_argument("--dataset", default="shakespeare", help="folder under data/ made by prepare.py")
+    p.add_argument("--resume", action="store_true",
+                   help="continue the run in --out_dir from its last.pt, with the settings it started with")
     # model size
     p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4)
@@ -72,6 +74,14 @@ def get_args():
         if unknown:
             p.error(f"unknown settings in {args.config}: {', '.join(sorted(unknown))}")
         p.set_defaults(**settings)
+    if args.resume:
+        # Same idea: the stopped run's settings.json becomes the defaults, so the model is
+        # rebuilt the same shape. Flags still win, e.g. --max_iters to train for longer.
+        saved = Path(__file__).parent / args.out_dir / "settings.json"
+        if not saved.exists():
+            p.error(f"--resume: no run to continue in {saved.parent}")
+        settings = json.loads(saved.read_text())
+        p.set_defaults(**{k: v for k, v in settings.items() if k not in ("config", "out_dir", "resume")})
     args = p.parse_args()
     args.out_dir = Path(__file__).parent / args.out_dir  # relative paths are relative to the project
     return args
@@ -175,20 +185,34 @@ def main():
         print("Warning: on Apple GPUs, checkpointing can't replay dropout exactly, so gradients"
               " are slightly off. Use --dropout 0 with it, or train on the halo.")
 
+    start, best_val = 0, float("inf")
+    if args.resume:
+        # The optimizer state matters as much as the weights: AdamW keeps a running
+        # average of every weight's gradients, and starting those from zero would
+        # jolt a half-trained model.
+        ck = torch.load(args.out_dir / "last.pt", map_location=device)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        start = ck["step"]
+        best_val = ck.get("best_val", float("inf"))  # older checkpoints didn't record it
+        # Reseed so the batches from here on aren't a replay of the ones from step 0.
+        torch.manual_seed(args.seed + start)
+        np.random.seed(args.seed + start)
+        print(f"Resuming from step {start} of {args.max_iters}")
+
     # Record exactly what produced this run, so you can compare or repeat it later.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     settings = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     (args.out_dir / "settings.json").write_text(json.dumps(settings, indent=2))
-    best_val = float("inf")
     t0 = t_log = time.time()
 
     def save(path, step):
-        # Everything needed to sample from this model, plus the optimizer state and
-        # step number so a run could be picked back up from here.
+        # Everything needed to sample from this model, plus what --resume needs to
+        # pick the run back up from here: optimizer state, step and best val loss.
         torch.save({"model": model.state_dict(), "config": asdict(cfg), "chars": chars,
-                    "optimizer": optimizer.state_dict(), "step": step}, path)
+                    "optimizer": optimizer.state_dict(), "step": step, "best_val": best_val}, path)
 
-    for it in range(args.max_iters + 1):
+    for it in range(start, args.max_iters + 1):
         for g in optimizer.param_groups:
             g["lr"] = lr_at(it, args)
 

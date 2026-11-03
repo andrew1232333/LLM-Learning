@@ -55,6 +55,17 @@ Each run writes to its own `out_dir`:
 - `settings.json`: every setting that produced the run
 
 Both checkpoints work with `sample.py --ckpt`, so you can sample a run while it's still training.
+
+To continue a run you stopped, pass `--resume` with its `out_dir`. It reloads `last.pt` (weights,
+optimizer state and step) and the run's `settings.json`, so nothing else needs retyping:
+
+```bash
+uv run train.py --resume --out_dir out/medium                   # finish where it stopped
+uv run train.py --resume --out_dir out/medium --max_iters 8000  # or train for longer
+```
+
+It restarts from the last `ckpt_interval` save, so up to 99 steps are redone. Raising `max_iters`
+stretches the learning-rate schedule, so the rate jumps back up a little when the run continues.
 Every `log_interval` steps (default 10) training prints the loss on the batch it just trained
 on, plus the learning rate and speed. That number is noisy; the `train loss | val loss` lines,
 which average many batches, are the ones to compare. Give experiments different `out_dir`s so they don't overwrite
