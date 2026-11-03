@@ -17,6 +17,7 @@ uv run sample.py --prompt "ROMEO:"
 |---|---|---|
 | `shakespeare` (default) | Tiny Shakespeare, downloaded | 1.1M characters |
 | `python` | Python's standard library source, read from your own Python install | 7.8M characters |
+| `python+docs` | That source plus the official Python docs (tutorial, library reference, HOWTOs), downloaded from python.org | 21.6M characters |
 
 ```bash
 uv run prepare.py --dataset python
@@ -45,6 +46,7 @@ uv run sample.py --ckpt out/medium-drop3
 | `configs/small.toml` | 0.8M | ~2-3 min on an M5 Mac or the halo |
 | `configs/medium.toml` | 10.8M | ~40 min on an M5 Mac, ~15 min on the halo |
 | `configs/code.toml` | 10.8M | same as medium, trains on Python code |
+| `configs/code-docs.toml` | 10.8M | ~30 min on the halo: code + docs, 10,000 steps |
 
 Each run writes to its own `out_dir`:
 
@@ -77,6 +79,33 @@ in side-by-side runs. `torch.compile` on the Mac computed gradients that were no
 the real ones: loss matched to 6 decimals, gradients differed by ~10x. Training still crept
 along (AdamW mostly cares about direction) but learned measurably worse. The lesson: a
 speedup is only a speedup if the numbers are still right, so check before trusting one.
+
+## Long context (large `block_size`)
+
+Attention compares every character in the window with every other one, so each head in each
+layer builds a `block_size × block_size` table. Double the context and those tables get 4x
+bigger. At long context they're nearly all of the memory, which means:
+
+- **`n_head` is the biggest lever.** Each head has its own table. Fewer heads means less
+  memory and more speed, with the same parameter count (each head just gets wider).
+- **`batch_size`** scales memory linearly. Keep `batch_size × block_size` around 16k-130k characters per step.
+- **`--grad_checkpoint`** keeps only each block's input and recomputes the rest during
+  backprop: ~3.5x less memory for ~28% less speed. Gradients are identical on the halo. On
+  Apple GPUs it can't replay dropout exactly, so use `--dropout 0` with it there.
+- `n_embd` barely matters for memory at long context; it mostly sets the parameter count.
+
+Measured on the halo (6 layers unless noted), memory per sequence in the batch:
+
+| `block_size` | Model | Normal | `--grad_checkpoint` | Speed with checkpointing |
+|---|---|---|---|---|
+| 4096 | `n_embd 1024, n_head 16` (80M) | 14.5 GB | 4.4 GB | 2,900 chars/s |
+| 4096 | `n_embd 1024, n_head 4` (80M) | 4.3 GB | 1.2 GB | 7,500 chars/s |
+| 8192 | `n_embd 1024, n_head 4` (84M) | | 4.5 GB | 4,400 chars/s |
+| 8192 | `n_embd 512, n_head 4, n_layer 4` (17M) | | 4.5 GB | 8,500 chars/s |
+
+Pick `batch_size` so the total stays under ~90 GB on the halo. The real fix is a fused
+attention kernel that never stores the whole table (`--sdpa`), but that crashes during
+training on the halo's current PyTorch build.
 
 ## Read the code in this order
 

@@ -1,0 +1,18 @@
+# Train on Python source code plus the official docs
+# (run `uv run prepare.py --dataset python+docs` first).
+# Same model as code.toml, but ~2.8x more text, so it trains for longer.
+dataset = "python+docs"
+out_dir = "out/code-docs"
+
+# model size
+n_layer = 6
+n_head = 6
+n_embd = 384
+block_size = 256
+dropout = 0.1
+
+# training
+batch_size = 64
+max_iters = 10000   # ~30 min on the halo
+lr = 1e-3
+eval_interval = 500

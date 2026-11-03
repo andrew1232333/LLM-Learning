@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -25,6 +26,7 @@ class GPTConfig:
     n_embd: int = 256      # size of each token's vector
     dropout: float = 0.1
     sdpa: bool = False     # use PyTorch's fused attention kernel (same math; see README for when it helps)
+    grad_checkpoint: bool = False  # trade compute for memory during training (see GPT.forward)
 
 
 class CausalSelfAttention(nn.Module):
@@ -140,7 +142,15 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)
         x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))  # (B, T, C)
         for block in self.blocks:
-            x = block(x)
+            if self.cfg.grad_checkpoint and self.training:
+                # Normally every block keeps its intermediate results (including the big
+                # T x T attention tables) until backprop needs them, so memory grows with
+                # the number of layers. Checkpointing keeps only each block's input and
+                # recomputes the rest during backprop, one block at a time: about 30% more
+                # compute for a fraction of the memory. Dropout masks are replayed exactly.
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         logits = self.head(self.ln_f(x))  # (B, T, vocab_size)
 
         loss = None

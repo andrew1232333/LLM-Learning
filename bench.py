@@ -45,7 +45,8 @@ def sync(device):
 def time_variant(args, data, vocab_size, device):
     torch.manual_seed(args.seed)
     cfg = GPTConfig(vocab_size=vocab_size, block_size=args.block_size, n_layer=args.n_layer,
-                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout, sdpa=args.sdpa)
+                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout, sdpa=args.sdpa,
+                    grad_checkpoint=args.grad_checkpoint)
     model = GPT(cfg).to(device)
     optimizer = train.make_optimizer(model, args)
     fast_model = torch.compile(model) if args.compile else model

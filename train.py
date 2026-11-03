@@ -59,6 +59,9 @@ def get_args():
                    help="fused AdamW optimizer step")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                    help="torch.compile the model (slow first step, faster after)")
+    # memory
+    p.add_argument("--grad_checkpoint", action=argparse.BooleanOptionalAction, default=False,
+                   help="recompute activations during backprop: less memory, ~30%% slower")
 
     # Two passes: read the config file first and make its values the new defaults,
     # then parse again so anything typed on the command line still wins.
@@ -158,7 +161,8 @@ def main():
     }
 
     cfg = GPTConfig(vocab_size=len(chars), block_size=args.block_size, n_layer=args.n_layer,
-                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout, sdpa=args.sdpa)
+                    n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout, sdpa=args.sdpa,
+                    grad_checkpoint=args.grad_checkpoint)
     model = GPT(cfg).to(device)
     print(f"Device: {device} | Parameters: {model.num_params() / 1e6:.2f}M")
     optimizer = make_optimizer(model, args)
@@ -167,6 +171,9 @@ def main():
     fast_model = torch.compile(model) if args.compile else model
     if args.compile and device == "mps":
         print("Warning: torch.compile on Apple GPUs gave wrong gradients in testing. See README.")
+    if args.grad_checkpoint and device == "mps" and args.dropout > 0:
+        print("Warning: on Apple GPUs, checkpointing can't replay dropout exactly, so gradients"
+              " are slightly off. Use --dropout 0 with it, or train on the halo.")
 
     # Record exactly what produced this run, so you can compare or repeat it later.
     args.out_dir.mkdir(parents=True, exist_ok=True)
