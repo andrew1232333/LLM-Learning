@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from model import GPT, GPTConfig
+from tokenizer import Tokenizer
 
 DATA_DIR = Path(__file__).parent / "data"
 OUT_DIR = Path(__file__).parent / "out"
@@ -164,17 +165,22 @@ def main():
     data_dir = DATA_DIR / args.dataset
     if not (data_dir / "meta.json").exists():
         raise SystemExit(f"No data in {data_dir}. Run: uv run prepare.py --dataset {args.dataset}")
-    chars = json.loads((data_dir / "meta.json").read_text())["chars"]
+    meta = json.loads((data_dir / "meta.json").read_text())
+    tok = Tokenizer(meta["chars"], meta.get("merges", []))
+    chars_per_token = meta.get("chars_per_token", 1.0)
     splits = {
         "train": np.fromfile(data_dir / "train.bin", dtype=np.uint16),
         "val": np.fromfile(data_dir / "val.bin", dtype=np.uint16),
     }
 
-    cfg = GPTConfig(vocab_size=len(chars), block_size=args.block_size, n_layer=args.n_layer,
+    cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=args.block_size, n_layer=args.n_layer,
                     n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout, sdpa=args.sdpa,
                     grad_checkpoint=args.grad_checkpoint)
     model = GPT(cfg).to(device)
     print(f"Device: {device} | Parameters: {model.num_params() / 1e6:.2f}M")
+    if tok.merges:
+        print(f"BPE tokenizer: {tok.vocab_size} tokens, {chars_per_token:.2f} characters per token, "
+              f"so the {args.block_size}-token context covers ~{args.block_size * chars_per_token:,.0f} characters")
     optimizer = make_optimizer(model, args)
     # torch.compile traces the model once and generates fused kernels for it. We train
     # through the compiled version but save and sample from the plain one.
@@ -209,8 +215,8 @@ def main():
     def save(path, step):
         # Everything needed to sample from this model, plus what --resume needs to
         # pick the run back up from here: optimizer state, step and best val loss.
-        torch.save({"model": model.state_dict(), "config": asdict(cfg), "chars": chars,
-                    "optimizer": optimizer.state_dict(), "step": step, "best_val": best_val}, path)
+        torch.save({"model": model.state_dict(), "config": asdict(cfg),
+                    "chars": tok.chars, "merges": tok.merges, "optimizer": optimizer.state_dict(), "step": step, "best_val": best_val}, path)
 
     for it in range(start, args.max_iters + 1):
         for g in optimizer.param_groups:
@@ -218,7 +224,10 @@ def main():
 
         if it % args.eval_interval == 0:
             losses = estimate_loss(fast_model, splits, args, device)
-            print(f"step {it:5d} | train loss {losses['train']:.3f} | val loss {losses['val']:.3f}"
+            # With BPE, also show val loss per character: that's the number to compare
+            # against character-level runs.
+            per_char = f" ({losses['val'] / chars_per_token:.3f}/char)" if tok.merges else ""
+            print(f"step {it:5d} | train loss {losses['train']:.3f} | val loss {losses['val']:.3f}{per_char}"
                   f" | {time.time() - t0:.0f}s")
             if losses["val"] < best_val:
                 best_val = losses["val"]
@@ -245,10 +254,9 @@ def main():
     print(f"\nBest val loss {best_val:.3f}. Checkpoint saved to {args.out_dir / 'ckpt.pt'}")
     print("\n--- sample ---")
     model.eval()
-    stoi = {c: i for i, c in enumerate(chars)}
-    start = torch.tensor([[stoi["\n"]]], device=device)
+    start = torch.tensor([tok.encode("\n")], device=device)
     out = model.generate(start, max_new_tokens=400, temperature=0.8, top_k=40)
-    print("".join(chars[i] for i in out[0].tolist()))
+    print(tok.decode(out[0].tolist()))
 
 
 if __name__ == "__main__":

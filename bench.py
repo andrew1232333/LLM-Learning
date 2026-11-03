@@ -71,7 +71,8 @@ def main():
     args = train.get_args()
     device = train.pick_device()
     data_dir = train.DATA_DIR / args.dataset
-    vocab_size = len(json.loads((data_dir / "meta.json").read_text())["chars"])
+    meta = json.loads((data_dir / "meta.json").read_text())
+    vocab_size = len(meta["chars"]) + len(meta.get("merges", []))
     data = np.fromfile(data_dir / "train.bin", dtype=np.uint16)
 
     name = torch.cuda.get_device_name(0) if device == "cuda" else device

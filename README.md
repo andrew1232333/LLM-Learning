@@ -29,6 +29,39 @@ Each dataset lives in `data/<name>/`. `input.txt` there is the exact text the mo
 so open it to see what the model is learning from. To add your own, write a loader in
 `prepare.py`: any function that returns one big string works.
 
+## Tokenizers: characters or BPE
+
+By default every character is one token. `--vocab_size` trains a byte-pair encoding (BPE)
+tokenizer instead (`tokenizer.py`), the kind every real LLM uses:
+
+```bash
+uv run prepare.py --dataset python+docs --vocab_size 2048   # writes data/python+docs-bpe2048
+uv run train.py --config configs/code-docs.toml --dataset python+docs-bpe2048 --out_dir out/bpe
+uv run tokenizer.py --dataset python+docs                    # just show how code gets split
+```
+
+BPE starts from characters and keeps merging the most common neighbouring pair into a new
+token. Before counting pairs it splits the text along Python's structure, so merges never
+cross from a name into punctuation, and a newline plus the next line's indentation stays
+together. (Leading indentation is 20% of the standard library's characters.) A line of code
+comes out like this:
+
+```
+def | ( | self | , |  name | ): | \n         | return |  f | " | H | el | lo
+```
+
+At 2048 tokens the text shrinks to ~3 characters per token, so the same `block_size` sees 3x
+more code. Things to know:
+
+- **Loss per token isn't comparable with characters.** A token is ~3 characters, so it's
+  harder to guess. With BPE the eval lines also print val loss per character
+  (`val loss 4.687 (1.512/char)`); compare that number against character-level runs.
+- **Step 0 loss is `ln(vocab_size)`**: ~7.6 for 2048 tokens.
+- **Keep the vocabulary small for small data.** Real models use 50k-200k tokens, but each
+  extra token is seen less often, so with ~20M characters 2k-4k is plenty.
+- **Don't end a prompt with a space.** In training the space is part of the next word
+  (`" name"`), so a prompt ending in `"def "` leaves the model in an odd spot. Use `"def"`.
+
 ## Configuring a run
 
 Every setting is a flag on `train.py` (`uv run train.py --help` lists them). To keep a setup
@@ -123,6 +156,7 @@ training on the halo's current PyTorch build.
 | File | What it teaches |
 |---|---|
 | `prepare.py` | Tokenization: text becomes integers. Train/val split. |
+| `tokenizer.py` | BPE: learning subword tokens from data, encoding and decoding. |
 | `model.py` | The transformer: embeddings, attention, MLP, residuals, layer norm. |
 | `train.py` | The training loop: batches, loss, backprop, optimizer, learning-rate schedule. |
 | `sample.py` | Generation: temperature, top-k, feeding outputs back in. |
@@ -154,8 +188,6 @@ training on the halo's current PyTorch build.
 
 ## Where to go next
 
-- **Subword tokenization (BPE).** Write a byte-pair encoder so tokens are word pieces, not
-  characters. This is how every real LLM tokenizes.
 - **Fine-tuning a pretrained model.** Take an existing small open model (e.g. from Hugging Face)
   and fine-tune it on your own data, with LoRA to keep memory low. This is where most
   real-world "training an LLM" actually happens.
