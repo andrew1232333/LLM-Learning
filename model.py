@@ -20,9 +20,9 @@ import torch.nn.functional as F
 class GPTConfig:
     vocab_size: int = 65
     block_size: int = 4096  # max context length: how many tokens the model can look back
-    n_layer: int = 4       # number of transformer blocks stacked on top of each other
-    n_head: int = 4        # attention heads per block
-    n_embd: int = 128      # size of each token's vector
+    n_layer: int = 16       # number of transformer blocks stacked on top of each other
+    n_head: int = 16        # attention heads per block
+    n_embd: int = 256      # size of each token's vector
     dropout: float = 0.1
 
 
