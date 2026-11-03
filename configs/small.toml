@@ -1,0 +1,15 @@
+# ~0.8M parameters. A few minutes on a laptop. Val loss ~1.55.
+# Any setting left out uses the default in train.py.
+out_dir = "out/small"
+
+# model size
+n_layer = 4
+n_head = 4
+n_embd = 128
+block_size = 128
+dropout = 0.1
+
+# training
+batch_size = 64
+max_iters = 3000
+lr = 1e-3

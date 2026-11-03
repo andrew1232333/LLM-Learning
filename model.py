@@ -24,6 +24,7 @@ class GPTConfig:
     n_head: int = 16        # attention heads per block
     n_embd: int = 256      # size of each token's vector
     dropout: float = 0.1
+    sdpa: bool = False     # use PyTorch's fused attention kernel (same math; see README for when it helps)
 
 
 class CausalSelfAttention(nn.Module):
@@ -42,6 +43,8 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
+        self.sdpa = cfg.sdpa
+        self.dropout_p = cfg.dropout
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # q, k, v in one matmul
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.dropout = nn.Dropout(cfg.dropout)
@@ -58,12 +61,18 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
 
-        # Attention scores: how relevant is every token to every other token. (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)  # each row now sums to 1
-        att = self.dropout(att)
-        y = att @ v  # weighted mix of values: (B, nh, T, hs)
+        if self.sdpa:
+            # Exactly the four lines in the else-branch, done in one fused GPU kernel.
+            # It never writes the full (T, T) score matrix to memory, which is the slow part.
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=self.dropout_p if self.training else 0.0)
+        else:
+            # Attention scores: how relevant is every token to every other token. (B, nh, T, T)
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)  # each row now sums to 1
+            att = self.dropout(att)
+            y = att @ v  # weighted mix of values: (B, nh, T, hs)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # glue heads back together
         return self.dropout(self.proj(y))

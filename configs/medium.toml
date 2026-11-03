@@ -1,0 +1,16 @@
+# ~10.8M parameters. Best run on a GPU with room to spare (the halo).
+# Bigger models memorize small datasets faster, so dropout goes up.
+out_dir = "out/medium"
+
+# model size
+n_layer = 6
+n_head = 6
+n_embd = 384
+block_size = 256
+dropout = 0.2
+
+# training
+batch_size = 64
+max_iters = 5000
+lr = 1e-3
+eval_interval = 500

@@ -1,0 +1,18 @@
+# Train on Python source code (run `uv run prepare.py --dataset python` first).
+# Same model as medium. With ~8x more text than Shakespeare it has far more to
+# learn from, so it shouldn't start memorizing as early.
+dataset = "python"
+out_dir = "out/code"
+
+# model size
+n_layer = 6
+n_head = 6
+n_embd = 384
+block_size = 256    # ~256 characters: enough to see a whole short function
+dropout = 0.1
+
+# training
+batch_size = 64
+max_iters = 5000
+lr = 1e-3
+eval_interval = 500

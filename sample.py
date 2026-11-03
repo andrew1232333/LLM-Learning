@@ -4,6 +4,7 @@ Step 4: talk to your model.
 Run:  uv run sample.py
       uv run sample.py --prompt "ROMEO:" --temperature 0.5
       uv run sample.py --temperature 1.5    # wilder, more random
+      uv run sample.py --ckpt out/medium    # a different run
 """
 
 import argparse
@@ -14,11 +15,13 @@ import torch
 from model import GPT, GPTConfig
 from train import pick_device
 
-CKPT = Path(__file__).parent / "out" / "ckpt.pt"
+PROJECT_DIR = Path(__file__).parent
 
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--ckpt", type=Path, default=Path("out"),
+                   help="checkpoint file, or a run's out_dir containing ckpt.pt")
     p.add_argument("--prompt", default="\n")
     p.add_argument("--tokens", type=int, default=500)
     p.add_argument("--temperature", type=float, default=0.8,
@@ -28,7 +31,10 @@ def main():
     args = p.parse_args()
 
     device = pick_device()
-    ckpt = torch.load(CKPT, map_location=device)
+    ckpt_path = PROJECT_DIR / args.ckpt
+    if ckpt_path.is_dir():
+        ckpt_path = ckpt_path / "ckpt.pt"
+    ckpt = torch.load(ckpt_path, map_location=device)
     chars = ckpt["chars"]
     stoi = {c: i for i, c in enumerate(chars)}
 
