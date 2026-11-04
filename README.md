@@ -85,7 +85,8 @@ uv run sample.py --ckpt out/medium-drop3
 Each run writes to its own `out_dir`:
 
 - `ckpt.pt`: the model with the best val loss so far (checked every `eval_interval` steps)
-- `last.pt`: the latest model, saved every `ckpt_interval` steps (default 100)
+- `last.pt`: the latest model, saved every `ckpt_interval` steps (default 100). With
+  several machines, each one keeps its own
 - `settings.json`: every setting that produced the run
 
 Both checkpoints work with `sample.py --ckpt`, so you can sample a run while it's still training.
@@ -98,7 +99,7 @@ uv run train.py --resume --out_dir out/medium                   # finish where i
 uv run train.py --resume --out_dir out/medium --max_iters 8000  # or train for longer
 ```
 
-It restarts from the last `ckpt_interval` save, so up to 99 steps are redone. Raising `max_iters`
+It restarts from the last `ckpt_interval` save, so up to `ckpt_interval` steps are redone. Raising `max_iters`
 stretches the learning-rate schedule, so the rate jumps back up a little when the run continues.
 Every `log_interval` steps (default 10) training prints the loss on the batch it just trained
 on, plus the learning rate and speed. That number is noisy; the `train loss | val loss` lines,
@@ -170,9 +171,53 @@ python train.py --config configs/code-docs.toml --sync_every 60 --sync_addr 192.
 Only the serving machine evaluates and saves checkpoints. After each sync every machine
 prints the same `weight norm`, which shows the copies agree again.
 
+Averaging two machines' moves is like one step with a batch twice as big, not two steps:
+on the halo + Studio it ran 1.9x the steps per second but reached the same loss only ~1.25x
+sooner. `--outer_lr` and `--outer_momentum` (set on the serving machine) treat each averaged
+move like a gradient for an outer optimizer with Nesterov momentum, as DiLoCo does. On the
+same halo + Studio run, `--outer_momentum 0.3` beat plain averaging at every checkpoint
+(best 0.541 vs 0.558 per character in the same time), reaching plain averaging's final loss
+~20% sooner, and improved both code and docs on python+docs' val text. The DiLoCo paper's
+0.9 overshot in a small test (rounds there were ~100 steps; the paper's were 500).
+
+How often to sync barely matters: in a small test, syncing every ~5 steps and every ~44
+steps gave the same loss. What costs is splitting the work at all, since averaged moves act
+like one step on a bigger batch. A faster network only shortens the sync itself.
+
+If any machine stops (crash, Wi-Fi drop), the others stop with an error too rather than
+waiting forever, and every machine can `--resume` from its own `last.pt`.
+
 Ordinary data parallelism averages gradients after every step, so it needs a network
 nearly as fast as the GPU (10+ Gb/s). Averaging once a minute sends the model across once per
 round instead: a 27M-parameter model is 55 MB in bfloat16, a few seconds over Wi-Fi.
+
+## A bigger run: 236M parameters on 6B tokens of code
+
+The steps above scale up to a GPT-2-small-sized model trained for about a week on two
+machines, then instruction-tuned and scored on real coding benchmarks:
+
+```bash
+bash download.sh                                    # ~13 GB: GitHub Python, instructions, benchmarks
+uv run prepare_big.py --shards 24 --vocab_size 16384   # -> data/code-bpe16384, 6.0B tokens
+uv run train.py --dataset code-bpe16384 --n_layer 16 --n_embd 1024 --n_head 16 \
+    --block_size 1024 --batch_size 16 --dropout 0 --max_iters 280000 --lr 3e-4 ...
+uv run finetune.py --ckpt out/code-236m --out_dir out/code-236m-sft
+uv run evaluate.py --ckpt out/code-236m-sft
+```
+
+- **Data**: `codeparrot/codeparrot-clean`, ~5M Python files from GitHub with duplicates
+  removed. The first 24 of its 54 shards, after dropping non-ASCII files, are 22.8G
+  characters. `prepare_big.py` streams them through 25 processes (~8 minutes on the halo).
+- **End-of-text token**: every file ends with one, so the model learns where a file stops.
+  Instruction tuning puts one after each answer, so the model learns to stop talking.
+- **Tokenizer**: 16,384 tokens learned from 200 MB of the code, ~3.8 characters per token.
+- **Sizing**: at ~4,600 tokens/s per machine, a week on two machines is ~5B tokens, about
+  20 tokens per parameter for 236M parameters (the "Chinchilla" rule of thumb).
+- **Dropout 0**: the run sees each token less than once, so there's nothing to memorize.
+- **Instruction tuning** (`finetune.py`): ~85k Python request → answer pairs from
+  Magicoder. Only the answer tokens count toward the loss.
+- **Scoring** (`evaluate.py`): HumanEval and MBPP, pass@1. It runs the generated code
+  against the benchmark's tests. The 27M model above scores 0% on both.
 
 ## Read the code in this order
 
@@ -182,7 +227,10 @@ round instead: a 27M-parameter model is 55 MB in bfloat16, a few seconds over Wi
 | `tokenizer.py` | BPE: learning subword tokens from data, encoding and decoding. |
 | `model.py` | The transformer: embeddings, attention, MLP, residuals, layer norm. |
 | `train.py` | The training loop: batches, loss, backprop, optimizer, learning-rate schedule. |
-| `sample.py` | Generation: temperature, top-k, feeding outputs back in. |
+| `sample.py` | Generation: temperature, top-k, feeding outputs back in, the KV cache. |
+| `prepare_big.py` | Preparing tens of GB: streaming, many processes, memory-mapped files. |
+| `finetune.py` | Instruction tuning: prompt format, training only on the answers. |
+| `evaluate.py` | Scoring generated code by running it against unit tests. |
 | `bench.py` | Measuring speed, and checking a speedup didn't change the math. |
 | `diloco.py` | Training on several machines by averaging weights every so often. |
 

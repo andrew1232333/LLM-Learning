@@ -51,10 +51,15 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.dropout = nn.Dropout(cfg.dropout)
         # Lower-triangular mask: position t may attend to positions 0..t only.
-        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size))
-        self.register_buffer("mask", mask.view(1, 1, cfg.block_size, cfg.block_size))
+        # persistent=False: it's rebuilt from block_size, so it needn't bloat every checkpoint.
+        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
+        self.register_buffer("mask", mask.view(1, 1, cfg.block_size, cfg.block_size), persistent=False)
 
-    def forward(self, x):
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        state_dict.pop(prefix + "mask", None)  # older checkpoints saved the mask; ignore it
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def forward(self, x, cache=None):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         # Split C into n_head smaller heads so each can specialize: (B, n_head, T, head_size)
@@ -62,16 +67,24 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, hs).transpose(1, 2)
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+        if cache is not None:
+            # Generating: the keys and values of earlier tokens never change, so keep them
+            # and only compute the new token's. (The "KV cache".)
+            if "k" in cache:
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+        Tk = k.size(2)  # how many tokens can be looked at: earlier ones plus these T
 
         if self.sdpa:
             # Exactly the four lines in the else-branch, done in one fused GPU kernel.
             # It never writes the full (T, T) score matrix to memory, which is the slow part.
             y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, dropout_p=self.dropout_p if self.training else 0.0)
+                q, k, v, is_causal=T == Tk, dropout_p=self.dropout_p if self.training else 0.0)
         else:
-            # Attention scores: how relevant is every token to every other token. (B, nh, T, T)
+            # Attention scores: how relevant is every token to every other token. (B, nh, T, Tk)
             att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)
-            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            att = att.masked_fill(self.mask[:, :, Tk - T:Tk, :Tk] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)  # each row now sums to 1
             att = self.dropout(att)
             y = att @ v  # weighted mix of values: (B, nh, T, hs)
@@ -110,8 +123,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, cache=None):
+        x = x + self.attn(self.ln1(x), cache)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -127,6 +140,12 @@ class GPT(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)  # vector -> logits
         self.apply(self._init_weights)
+        # Each block adds its output onto the residual stream, so with many blocks the
+        # stream's size grows with depth. Starting the layers that write into it smaller
+        # (by 1/sqrt(2 per block)) keeps it steady at the start of training, as GPT-2 does.
+        for block in self.blocks:
+            for m in (block.attn.proj, block.mlp.net[2]):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Linear, nn.Embedding)):
@@ -137,12 +156,15 @@ class GPT(nn.Module):
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, cache=None):
         B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
+        start = cache[0]["k"].size(2) if cache and "k" in cache[0] else 0  # tokens already cached
+        pos = torch.arange(start, start + T, device=idx.device)
         x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))  # (B, T, C)
-        for block in self.blocks:
-            if self.cfg.grad_checkpoint and self.training:
+        for i, block in enumerate(self.blocks):
+            if cache is not None:
+                x = block(x, cache[i])
+            elif self.cfg.grad_checkpoint and self.training:
                 # Normally every block keeps its intermediate results (including the big
                 # T x T attention tables) until backprop needs them, so memory grows with
                 # the number of layers. Checkpointing keeps only each block's input and
@@ -157,20 +179,36 @@ class GPT(nn.Module):
         if targets is not None:
             # Cross-entropy: how surprised was the model by the real next token?
             # A random guess over 65 characters gives ln(65) ~= 4.17.
-            loss = F.cross_entropy(logits.view(B * T, -1), targets.view(B * T))
+            # Targets of -100 are skipped (instruction tuning uses that for the prompt).
+            loss = F.cross_entropy(logits.view(B * T, -1), targets.view(B * T), ignore_index=-100)
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Generate text one token at a time, feeding each output back in."""
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop=None):
+        """Generate text one token at a time, feeding each output back in.
+        temperature=0 always takes the most likely token. Stops early once every
+        sequence has produced the token id `stop`."""
+        cache = [{} for _ in self.blocks]
+        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size:]  # crop to the context window
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature   # only the last position matters
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)  # sample, don't just take the max
+            if idx.size(1) <= self.cfg.block_size:
+                # With the cache, only the newest token needs a forward pass.
+                logits, _ = self(idx[:, -1:] if "k" in cache[0] else idx, cache=cache)
+            else:
+                logits, _ = self(idx[:, -self.cfg.block_size:])  # past the window: crop, no cache
+            logits = logits[:, -1, :]  # only the last position matters
+            if temperature == 0:
+                next_id = logits.argmax(dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)  # sample, don't just take the max
             idx = torch.cat([idx, next_id], dim=1)
+            if stop is not None:
+                done |= next_id[:, 0] == stop
+                if done.all():
+                    break
         return idx

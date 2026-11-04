@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 
 from model import GPT, GPTConfig
-from tokenizer import Tokenizer
+from tokenizer import EOT, Tokenizer
 from train import pick_device
 
 PROJECT_DIR = Path(__file__).parent
@@ -26,7 +26,7 @@ def main():
     p.add_argument("--prompt", default="\n")
     p.add_argument("--tokens", type=int, default=500)
     p.add_argument("--temperature", type=float, default=0.8,
-                   help="<1 = safer/more repetitive, >1 = more creative/chaotic")
+                   help="<1 = safer/more repetitive, >1 = more creative/chaotic, 0 = always the likeliest")
     p.add_argument("--top_k", type=int, default=40,
                    help="only sample from the k most likely next tokens")
     args = p.parse_args()
@@ -46,8 +46,10 @@ def main():
         idx = torch.tensor([tok.encode(args.prompt)], device=device)
     except ValueError as e:
         raise SystemExit(f"Can't use that prompt: {e}")
-    out = model.generate(idx, args.tokens, temperature=args.temperature, top_k=args.top_k)
-    print(tok.decode(out[0].tolist()))
+    # Models trained with an end-of-text token stop when they produce it.
+    stop = tok.char_ids.get(EOT)
+    out = model.generate(idx, args.tokens, temperature=args.temperature, top_k=args.top_k, stop=stop)
+    print(tok.decode(out[0].tolist()).replace(EOT, "\n<|endoftext|>"))
 
 
 if __name__ == "__main__":

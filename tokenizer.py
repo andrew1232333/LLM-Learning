@@ -15,6 +15,7 @@ Run:  uv run tokenizer.py --dataset python+docs   # show how some code gets spli
 """
 
 import argparse
+import heapq
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -23,13 +24,19 @@ from pathlib import Path
 # where the Python knowledge lives: a token can be "self" or "):" but never "f.n", and the
 # indentation that starts a line is kept together so it becomes one token.
 SPLIT = re.compile(r"""
-      \n[ ]*                       # newline + the next line's indentation (Python's blocks)
+      \x03                         # end of text: always a token of its own (see EOT)
+    | \n[ ]*                       # newline + the next line's indentation (Python's blocks)
     | [ ]?[A-Za-z_][A-Za-z0-9_]*   # a name or keyword, with the space before it
     | [ ]?[0-9]{1,3}               # numbers, at most 3 digits per chunk
-    | [ ]?[^\sA-Za-z0-9_]+         # operators and punctuation: ), ==, \"\"\", ->
+    | [ ]?[^\sA-Za-z0-9_\x03]+     # operators and punctuation: ), ==, \"\"\", ->
     | [ ]+                         # other runs of spaces (alignment, trailing)
     | \s                           # any other whitespace character
 """, re.VERBOSE)
+
+# End of text. Big datasets put it between documents, so the model learns where one file
+# stops and the next, unrelated one starts; instruction tuning puts it after each answer,
+# so the model learns to stop. It's a control character that never appears in the data.
+EOT = "\x03"
 
 
 class Tokenizer:
@@ -54,6 +61,8 @@ class Tokenizer:
         ids = []
         for chunk in SPLIT.findall(text):
             if chunk not in self.cache:  # the same chunks repeat endlessly, so remember them
+                if len(self.cache) > 1_000_000:  # but don't let rare ones fill the memory
+                    self.cache.clear()
                 self.cache[chunk] = self.encode_chunk(chunk)
             ids.extend(self.cache[chunk])
         return ids
@@ -73,9 +82,10 @@ class Tokenizer:
         return "".join(self.vocab[i] for i in ids)
 
     @classmethod
-    def train(cls, text, vocab_size):
-        """Learn merges from text until the vocabulary reaches vocab_size."""
-        chars = sorted(set(text))
+    def train(cls, text, vocab_size, chars=None):
+        """Learn merges from text until the vocabulary reaches vocab_size. Pass `chars` to
+        allow characters the training text happens not to contain."""
+        chars = sorted(set(text) | set(chars or ()))
         char_ids = {c: i for i, c in enumerate(chars)}
         # Work on distinct chunks with a count, not the whole text: "self" appears
         # ~100k times but only needs to be merged once.
@@ -90,9 +100,17 @@ class Tokenizer:
                 pairs[p] += freq[w]
                 where[p].add(w)
 
+        # Finding the most common pair by scanning all of them is slow once there are
+        # millions, so keep them in a heap too. Counts change as words merge, so the heap
+        # holds stale entries; skip any whose count no longer matches.
+        heap = [(-n, p) for p, n in pairs.items()]
+        heapq.heapify(heap)
+        changed = set()  # pairs whose count changed in this merge
         merges = []
-        while len(chars) + len(merges) < vocab_size and pairs:
-            best = max(pairs, key=pairs.get)
+        while len(chars) + len(merges) < vocab_size and heap:
+            n, best = heapq.heappop(heap)
+            if pairs.get(best) != -n:
+                continue
             new_id = len(chars) + len(merges)
             merges.append(best)
             # Only words containing the pair change. Take their old pairs out of the
@@ -101,12 +119,18 @@ class Tokenizer:
                 old = words[w]
                 for p in zip(old, old[1:]):
                     pairs[p] -= freq[w]
+                    changed.add(p)
                     if pairs[p] == 0:
                         del pairs[p]
                 words[w] = merge(old, best, new_id)
                 for p in zip(words[w], words[w][1:]):
                     pairs[p] += freq[w]
                     where[p].add(w)
+                    changed.add(p)
+            for p in changed:
+                if p in pairs:
+                    heapq.heappush(heap, (-pairs[p], p))
+            changed.clear()
         return cls(chars, merges)
 
 

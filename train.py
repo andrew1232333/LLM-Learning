@@ -24,7 +24,7 @@ import torch
 
 from diloco import Sync
 from model import GPT, GPTConfig
-from tokenizer import Tokenizer
+from tokenizer import EOT, Tokenizer
 
 DATA_DIR = Path(__file__).parent / "data"
 OUT_DIR = Path(__file__).parent / "out"
@@ -72,6 +72,10 @@ def get_args():
     p.add_argument("--sync_addr", default="localhost:29500", help="host:port of the machine running --serve")
     p.add_argument("--serve", action="store_true", help="host the averaging server (exactly one machine)")
     p.add_argument("--workers", type=int, default=2, help="how many machines train together")
+    p.add_argument("--outer_lr", type=float, default=1.0,
+                   help="server only: scale for each averaged move (DiLoCo uses 0.7)")
+    p.add_argument("--outer_momentum", type=float, default=0.0,
+                   help="server only: Nesterov momentum across rounds (DiLoCo uses 0.9; 0 = plain averaging)")
 
     # Two passes: read the config file first and make its values the new defaults,
     # then parse again so anything typed on the command line still wins.
@@ -175,9 +179,11 @@ def main():
     meta = json.loads((data_dir / "meta.json").read_text())
     tok = Tokenizer(meta["chars"], meta.get("merges", []))
     chars_per_token = meta.get("chars_per_token", 1.0)
+    # memmap reads the token files from disk as batches need them, instead of loading
+    # them whole: the big datasets are tens of GB.
     splits = {
-        "train": np.fromfile(data_dir / "train.bin", dtype=np.uint16),
-        "val": np.fromfile(data_dir / "val.bin", dtype=np.uint16),
+        "train": np.memmap(data_dir / "train.bin", dtype=np.uint16, mode="r"),
+        "val": np.memmap(data_dir / "val.bin", dtype=np.uint16, mode="r"),
     }
 
     cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=args.block_size, n_layer=args.n_layer,
@@ -215,13 +221,14 @@ def main():
 
     sync = None
     if args.sync_every:
-        if args.resume:
-            raise SystemExit("--resume and --sync_every can't be combined yet")
+        # Every machine starts from the main machine's weights and step, including when
+        # resuming. (The others still resume their own optimizer state from their last.pt.)
         sync = Sync(model, args, start)
+        start = sync.step
         # Each machine needs its own random batches, or they'd all learn the same thing.
-        torch.manual_seed(args.seed + 1000 * sync.rank)
-        np.random.seed(args.seed + 1000 * sync.rank)
-    is_main = sync is None or sync.rank == 0  # only the main machine evaluates and saves
+        torch.manual_seed(args.seed + 1000 * sync.rank + start)
+        np.random.seed(args.seed + 1000 * sync.rank + start)
+    is_main = sync is None or sync.rank == 0  # only the main machine evaluates and keeps ckpt.pt
 
     # Record exactly what produced this run, so you can compare or repeat it later.
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +248,7 @@ def main():
     # the learning-rate schedule and eval_interval are measured in.
     it = start
     next_eval = -(-start // args.eval_interval) * args.eval_interval  # first multiple >= start
+    next_ckpt = start + args.ckpt_interval
     while True:
         for g in optimizer.param_groups:
             g["lr"] = lr_at(it, args)
@@ -272,12 +280,16 @@ def main():
             print(f"step {it:5d} | batch loss {loss.item():.3f} | lr {lr_at(it, args):.2e} | {ms:.0f} ms/step")
             t_log = time.time()
 
-        if it % args.ckpt_interval == 0 and is_main:
+        if it >= next_ckpt:
+            # Every machine keeps its own last.pt, so all of them can --resume.
+            next_ckpt = it + args.ckpt_interval
             save(args.out_dir / "last.pt", it)
 
         if sync:
             sync.steps += 1
-            if sync.due():
+            # Reaching max_iters by this machine's own count forces a last sync, so every
+            # machine stops on the same agreed total instead of one hanging up on the rest.
+            if sync.due() or it >= args.max_iters:
                 it = sync(model)
 
     if not is_main:
@@ -288,7 +300,7 @@ def main():
     model.eval()
     start = torch.tensor([tok.encode("\n")], device=device)
     out = model.generate(start, max_new_tokens=400, temperature=0.8, top_k=40)
-    print(tok.decode(out[0].tolist()))
+    print(tok.decode(out[0].tolist()).replace(EOT, "\n<|endoftext|>\n"))
 
 
 if __name__ == "__main__":
