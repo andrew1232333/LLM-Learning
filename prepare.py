@@ -9,6 +9,7 @@ but the idea is the same: text -> list of ints -> model -> list of ints -> text.
 Run:  uv run prepare.py                          # Tiny Shakespeare (~1 MB, downloaded)
       uv run prepare.py --dataset python         # Python's own source code (~8 MB, already on disk)
       uv run prepare.py --dataset python+docs    # that code plus the official docs (~22 MB)
+      uv run prepare.py --dataset python+docs+packages   # plus every installed package's code
       uv run prepare.py --dataset python+docs --vocab_size 2048   # BPE instead of characters
 
 Each dataset gets its own folder under data/ (BPE ones get a suffix, e.g.
@@ -21,6 +22,7 @@ import io
 import json
 import random
 import ssl
+import string
 import sys
 import sysconfig
 import tarfile
@@ -97,11 +99,53 @@ def load_python_docs():
     return parts
 
 
+def load_packages():
+    """Every third-party package installed alongside Python (site-packages and, on
+    Debian/Ubuntu, dist-packages). How much this is depends on the machine: a fresh
+    venv has a few MB, a system with torch, scipy, sympy and friends has 100+ MB."""
+    dirs = sorted({Path(p) for p in sys.path
+                   if p.endswith(("site-packages", "dist-packages")) and Path(p).is_dir()})
+    allowed = set(string.printable) - set("\t\r\x0b\x0c") | {"\n"}  # same characters as python+docs
+    parts, seen = [], set()
+    for root in dirs:
+        print(f"Reading packages from {root}")
+        for path in sorted(root.rglob("*.py")):
+            if {"test", "tests", "testing", "__pycache__"} & set(path.relative_to(root).parts):
+                continue
+            try:
+                code = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            code = code.replace("\r\n", "\n").expandtabs(8)  # tabs indent to 8, as Python reads them
+            if (code in seen or not set(code) <= allowed
+                    or max(map(len, code.splitlines()), default=0) > 1000):
+                continue  # duplicates (vendored copies), odd characters, generated data tables
+            seen.add(code)
+            parts.append(f"# file: {path.relative_to(root)}\n{code}\n")
+    print(f"Using {len(parts)} package files")
+    return parts
+
+
+def load_python_docs_packages():
+    # Put the packages just before python+docs' val part, so the 90/10 split below keeps
+    # exactly that val text in val. A model trained here never sees it, so its loss on it
+    # can be compared with models trained on python+docs alone.
+    base_path = DATA_DIR / "python+docs" / "input.txt"
+    if not base_path.exists():
+        raise SystemExit("Run `uv run prepare.py --dataset python+docs` first")
+    base = base_path.read_text(encoding="utf-8")
+    packages = load_packages()
+    random.Random(0).shuffle(packages)
+    cut = int(0.9 * len(base))
+    return [base[:cut] + "".join(packages) + base[cut:]]
+
+
 # Each loader returns a list of documents (files, pages, or one big text).
 DATASETS = {
     "shakespeare": load_shakespeare,
     "python": load_python,
     "python+docs": lambda: load_python() + load_python_docs(),
+    "python+docs+packages": load_python_docs_packages,
 }
 
 

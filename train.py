@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from diloco import Sync
 from model import GPT, GPTConfig
 from tokenizer import Tokenizer
 
@@ -65,6 +66,12 @@ def get_args():
     # memory
     p.add_argument("--grad_checkpoint", action=argparse.BooleanOptionalAction, default=False,
                    help="recompute activations during backprop: less memory, ~30%% slower")
+    # several machines (see diloco.py)
+    p.add_argument("--sync_every", type=float, default=0,
+                   help="seconds between averaging weights with other machines (0 = train alone)")
+    p.add_argument("--sync_addr", default="localhost:29500", help="host:port of the machine running --serve")
+    p.add_argument("--serve", action="store_true", help="host the averaging server (exactly one machine)")
+    p.add_argument("--workers", type=int, default=2, help="how many machines train together")
 
     # Two passes: read the config file first and make its values the new defaults,
     # then parse again so anything typed on the command line still wins.
@@ -206,6 +213,16 @@ def main():
         np.random.seed(args.seed + start)
         print(f"Resuming from step {start} of {args.max_iters}")
 
+    sync = None
+    if args.sync_every:
+        if args.resume:
+            raise SystemExit("--resume and --sync_every can't be combined yet")
+        sync = Sync(model, args, start)
+        # Each machine needs its own random batches, or they'd all learn the same thing.
+        torch.manual_seed(args.seed + 1000 * sync.rank)
+        np.random.seed(args.seed + 1000 * sync.rank)
+    is_main = sync is None or sync.rank == 0  # only the main machine evaluates and saves
+
     # Record exactly what produced this run, so you can compare or repeat it later.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     settings = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
@@ -216,13 +233,20 @@ def main():
         # Everything needed to sample from this model, plus what --resume needs to
         # pick the run back up from here: optimizer state, step and best val loss.
         torch.save({"model": model.state_dict(), "config": asdict(cfg),
-                    "chars": tok.chars, "merges": tok.merges, "optimizer": optimizer.state_dict(), "step": step, "best_val": best_val}, path)
+                    "chars": tok.chars, "merges": tok.merges, "optimizer": optimizer.state_dict(),
+                    "step": step, "best_val": best_val}, path)
 
-    for it in range(start, args.max_iters + 1):
+    # `it` counts weight updates. Training alone it goes up by one per step; with --sync_every
+    # it jumps at each sync to the total across all machines, which is what max_iters,
+    # the learning-rate schedule and eval_interval are measured in.
+    it = start
+    next_eval = -(-start // args.eval_interval) * args.eval_interval  # first multiple >= start
+    while True:
         for g in optimizer.param_groups:
             g["lr"] = lr_at(it, args)
 
-        if it % args.eval_interval == 0:
+        if it >= next_eval and is_main:
+            next_eval = (it // args.eval_interval + 1) * args.eval_interval
             losses = estimate_loss(fast_model, splits, args, device)
             # With BPE, also show val loss per character: that's the number to compare
             # against character-level runs.
@@ -234,23 +258,31 @@ def main():
                 save(args.out_dir / "ckpt.pt", it)
             t_log = time.time()  # don't count evaluation time in the ms/step below
 
-        if it == args.max_iters:
+        if it >= args.max_iters:
             break
 
         x, y = get_batch(splits["train"], args.batch_size, args.block_size, device)
         loss = train_step(fast_model, optimizer, x, y, args, device)
-        step = it + 1  # number of weight updates done so far
+        it += 1
 
-        if step % args.log_interval == 0:
+        if it % args.log_interval == 0:
             # The loss on the one batch just trained on: noisy, but free. The eval lines
             # above average many batches, and include val, so they're the ones to trust.
             ms = (time.time() - t_log) / args.log_interval * 1000
-            print(f"step {step:5d} | batch loss {loss.item():.3f} | lr {lr_at(it, args):.2e} | {ms:.0f} ms/step")
+            print(f"step {it:5d} | batch loss {loss.item():.3f} | lr {lr_at(it, args):.2e} | {ms:.0f} ms/step")
             t_log = time.time()
 
-        if step % args.ckpt_interval == 0:
-            save(args.out_dir / "last.pt", step)
+        if it % args.ckpt_interval == 0 and is_main:
+            save(args.out_dir / "last.pt", it)
 
+        if sync:
+            sync.steps += 1
+            if sync.due():
+                it = sync(model)
+
+    if not is_main:
+        print("\nDone. The main machine has the checkpoints.")
+        return
     print(f"\nBest val loss {best_val:.3f}. Checkpoint saved to {args.out_dir / 'ckpt.pt'}")
     print("\n--- sample ---")
     model.eval()

@@ -18,6 +18,7 @@ uv run sample.py --prompt "ROMEO:"
 | `shakespeare` (default) | Tiny Shakespeare, downloaded | 1.1M characters |
 | `python` | Python's standard library source, read from your own Python install | 7.8M characters |
 | `python+docs` | That source plus the official Python docs (tutorial, library reference, HOWTOs), downloaded from python.org | 21.6M characters |
+| `python+docs+packages` | That plus the code of every package installed alongside Python (site-packages / dist-packages). Needs `python+docs` prepared first | depends on the machine: 155M characters on the halo |
 
 ```bash
 uv run prepare.py --dataset python
@@ -151,6 +152,28 @@ Pick `batch_size` so the total stays under ~90 GB on the halo. The real fix is a
 attention kernel that never stores the whole table (`--sdpa`), but that crashes during
 training on the halo's current PyTorch build.
 
+## Training on several machines
+
+`--sync_every N` trains one model on several machines at once (`diloco.py`). Each machine
+trains its own copy on its own batches for N seconds, then they average how far their
+weights moved (weighted by steps done, so a faster machine counts for more) and carry on
+from the same weights. One machine also runs the server with `--serve`:
+
+```bash
+# halo (serves and trains)
+python train.py --config configs/code-docs.toml --sync_every 60 --serve --workers 2
+# Mac (trains), same settings, pointed at the halo
+python train.py --config configs/code-docs.toml --sync_every 60 --sync_addr 192.168.4.103:29500
+```
+
+`max_iters`, the learning-rate schedule and `eval_interval` count steps across all machines.
+Only the serving machine evaluates and saves checkpoints. After each sync every machine
+prints the same `weight norm`, which shows the copies agree again.
+
+Ordinary data parallelism averages gradients after every step, so it needs a network
+nearly as fast as the GPU (10+ Gb/s). Averaging once a minute sends the model across once per
+round instead: a 27M-parameter model is 55 MB in bfloat16, a few seconds over Wi-Fi.
+
 ## Read the code in this order
 
 | File | What it teaches |
@@ -161,6 +184,7 @@ training on the halo's current PyTorch build.
 | `train.py` | The training loop: batches, loss, backprop, optimizer, learning-rate schedule. |
 | `sample.py` | Generation: temperature, top-k, feeding outputs back in. |
 | `bench.py` | Measuring speed, and checking a speedup didn't change the math. |
+| `diloco.py` | Training on several machines by averaging weights every so often. |
 
 ## What the numbers mean
 
